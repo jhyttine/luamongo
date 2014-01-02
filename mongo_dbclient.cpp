@@ -25,43 +25,195 @@ extern void lua_push_value(lua_State *L, const BSONElement &elem);
 
 DBClientBase* userdata_to_dbclient(lua_State *L, int stackpos)
 {
-    // adapted from http://www.lua.org/source/5.1/lauxlib.c.html#luaL_checkudata
-    void *ud = lua_touserdata(L, stackpos);
-    if (ud == NULL)
-        luaL_typerror(L, stackpos, "userdata");
+  // adapted from http://www.lua.org/source/5.1/lauxlib.c.html#luaL_checkudata
+  void *ud = lua_touserdata(L, stackpos);
+  if (ud == NULL)
+    luaL_typerror(L, stackpos, "userdata");
 
-    // try Connection
-    lua_getfield(L, LUA_REGISTRYINDEX, LUAMONGO_CONNECTION);
-    if (lua_getmetatable(L, stackpos))
+  // try Connection
+  lua_getfield(L, LUA_REGISTRYINDEX, LUAMONGO_CONNECTION);
+  if (lua_getmetatable(L, stackpos))
     {
-        if (lua_rawequal(L, -1, -2))
+      if (lua_rawequal(L, -1, -2))
         {
-            DBClientConnection *connection = *((DBClientConnection **)ud);
-            lua_pop(L, 2);
-            return connection;
+          DBClientConnection *connection = *((DBClientConnection **)ud);
+          lua_pop(L, 2);
+          return connection;
         }
-        lua_pop(L, 2);
+      lua_pop(L, 2);
     }
-    else
-        lua_pop(L, 1);
+  else
+    lua_pop(L, 1);
 
-    // try ReplicaSet
-    lua_getfield(L, LUA_REGISTRYINDEX, LUAMONGO_REPLICASET);  // get correct metatable
-    if (lua_getmetatable(L, stackpos))
+  // try ReplicaSet
+  lua_getfield(L, LUA_REGISTRYINDEX, LUAMONGO_REPLICASET);  // get correct metatable
+  if (lua_getmetatable(L, stackpos))
     {
-        if (lua_rawequal(L, -1, -2))
+      if (lua_rawequal(L, -1, -2))
         {
-            DBClientReplicaSet *replicaset = *((DBClientReplicaSet **)ud);
-            lua_pop(L, 2); // remove both metatables
-            return replicaset;
+          DBClientReplicaSet *replicaset = *((DBClientReplicaSet **)ud);
+          lua_pop(L, 2); // remove both metatables
+          return replicaset;
         }
-        lua_pop(L, 2);
+      lua_pop(L, 2);
     }
-    else
-        lua_pop(L, 1);
+  else
+    lua_pop(L, 1);
 
-    luaL_typerror(L, stackpos, LUAMONGO_DBCLIENT);
-    return NULL; // should never get here
+  luaL_typerror(L, stackpos, LUAMONGO_DBCLIENT);
+  return NULL; // should never get here
+}
+
+/***********************************************************************/
+// The following methods are helpers to parse lua tables parameter
+/***********************************************************************/
+
+/**
+ * Store helper
+ */
+template<typename T1>
+struct bson_store_to_target {
+};
+
+template<>
+struct bson_store_to_target<std::vector<BSONObj> > {
+
+    static inline bool store(BSONObj &obj, std::vector<BSONObj> &objects) {
+        objects.push_back(obj);
+        return true;
+    }
+
+};
+
+template<>
+struct bson_store_to_target<BSONObjBuilder > {
+
+    static inline bool store(BSONObj &obj, BSONObjBuilder &builder) {
+        builder.appendElementsUnique(obj);
+        return true;
+    }
+
+};
+
+/**
+ * Template to generate BSONObj with function T2 and store it to T1
+ */
+
+template<typename T1, bool (*T2)(lua_State *, int, BSONObj &)>
+struct lua_to_bson_generate_and_store {
+
+    static inline bool action(lua_State *L, int index, T1 &target) {
+        BSONObj obj;
+        if (T2(L, index, obj)) {
+            bson_store_to_target<T1>::store(obj, target);
+            return true;
+        }
+        return false;
+    }
+};
+
+/**
+ * To generate content to target from next source:
+ *    "array of lua tables" (ordered)
+ *       sub table object are generated with T2 function
+ *    "else"
+ *       object is generated with T3 function
+ */
+template<typename T1, bool (*T2)(lua_State *, int , BSONObj &), bool (*T3)(lua_State *, int, BSONObj &)>
+bool lua_to_bson_auto_array(lua_State *L, int index, T1& target) {
+    bool res = false;
+    int type = lua_type(L, index);
+    size_t tlen = lua_objlen(L, index);
+    if (type == LUA_TTABLE && tlen) {
+        for (size_t i = 1; i <= tlen; ++i) {
+            lua_rawgeti(L, index, i);
+            res = lua_to_bson_generate_and_store<T1, T2>::action(L, index + 1, target);
+            lua_pop(L, 1);
+            if (!res) {
+                break;
+            }
+        }
+    } else {
+        res = lua_to_bson_generate_and_store<T1, T3>::action(L, index, target);
+    }
+    return res;
+}
+
+/**
+ * To generate BSONObject from next source:
+ *    "json string"
+ *    "lua table"
+ */
+bool lua_to_bson_select(lua_State *L, int index, BSONObj &obj) {
+    int type = lua_type(L, index);
+    if (type == LUA_TSTRING) {
+        const char *jsonstr = luaL_checkstring(L, index);
+        obj = fromjson(jsonstr);
+        return true;
+    } else if (type == LUA_TTABLE) {
+        lua_to_bson(L, index, obj);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * To generate BSONObject from next source:
+ *    "json string"
+ *    "lua table"
+ *    "array of lua tables" (ordered)
+ */
+bool lua_to_bson_ordered(lua_State *L, int index, BSONObj &object) {
+    if (1) {
+        BSONObjBuilder builder;
+        if (lua_to_bson_auto_array<BSONObjBuilder, lua_to_bson_select, lua_to_bson_select>(L, index, builder)) {
+            object = builder.obj();
+            return true;
+        }
+    } else {
+        //totally without ordered support
+        //as before
+        if (lua_to_bson_select(L, index, object)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * To generate Query from next source:
+ *    "Query object"
+ *    "json string"
+ *    "lua table"
+ *    "array of lua tables" (ordered)
+ */
+bool lua_to_bson_ordered_query(lua_State *L, int index, Query &query) {
+    if (LUA_TUSERDATA == lua_type(L, index)) {
+        void *uq = 0;
+        uq = luaL_checkudata(L, index, LUAMONGO_QUERY);
+        query = *(*((Query **) uq));
+        return true;
+    } else {
+        BSONObj obj;
+        if (lua_to_bson_ordered(L, index, obj)) {
+            query = obj;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * To generate vector of BSONObj from next source:
+ *    "json string"
+ *    "lua table"
+ *    "array of" (batch)
+ *       "json string"
+ *       "lua table"
+ *       "array of lua tables" (ordered)
+ */
+bool lua_to_bson_batched(lua_State *L, int index, std::vector<BSONObj> &objects) {
+    return lua_to_bson_auto_array<std::vector<BSONObj>, lua_to_bson_ordered, lua_to_bson_select>(L, index, objects);
 }
 
 
@@ -70,42 +222,38 @@ DBClientBase* userdata_to_dbclient(lua_State *L, int stackpos)
 // (DBClientConnection and DBClientReplicaSet)
 /***********************************************************************/
 
-
 /*
- * created = db:ensure_index(ns, json_str or lua_table[, unique[, name]])
+ * created = db:ensure_index(ns, json_str or lua_table OR "ARRAY OF LUA TABLE" (ORDERED) [, unique[, name]])
  */
 static int dbclient_ensure_index(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
     BSONObj fields;
-
-    try {
-        int type = lua_type(L, 3);
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            fields = fromjson(jsonstr);
-        } else if (type == LUA_TTABLE) {
-            lua_to_bson(L, 3, fields);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "ensure_index", e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    if (!lua_to_bson_ordered(L, 3, fields)) {
+        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
     bool unique = lua_toboolean(L, 4);
     const char *name = luaL_optstring(L, 5, "");
+    bool cache = true;
+    bool backgroud = false;
+    int v_value = -1;
+    int ttl = luaL_optinteger(L, 6, 0);
 
-    bool res = dbclient->ensureIndex(ns, fields, unique, name);
+    bool res = dbclient->ensureIndex(ns, fields, unique, name, cache, backgroud, v_value, ttl);
 
     lua_pushboolean(L, res);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushboolean(L, 0);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION,
+                    "ensure_index", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushboolean(L, 0);
+    lua_pushstring(L, err);
+    return 2;
+  }
 }
 
 /*
@@ -118,8 +266,8 @@ static int dbclient_ensure_index(lua_State *L) {
  *
  */
 static int dbclient_auth(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     luaL_checktype(L, 2, LUA_TTABLE);
     lua_getfield(L, 2, "dbname");
     const char *dbname = luaL_checkstring(L, -1);
@@ -130,169 +278,153 @@ static int dbclient_auth(lua_State *L) {
     lua_getfield(L, 2, "digestPassword");
     bool digestPassword = lua_isnil(L, -1) ? true : lua_toboolean(L, -1);
     lua_pop(L, 4);
-
     std::string errmsg;
     bool success = dbclient->auth(dbname, username, password, errmsg, digestPassword);
     if (!success) {
-        lua_pushnil(L);
-        lua_pushfstring(L, LUAMONGO_ERR_CONNECTION_FAILED, errmsg.c_str());
-        return 2;
+      lua_pushnil(L);
+      lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "auth", errmsg.c_str());
+      return 2;
     }
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "auth", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "auth", err);
+    return 2;
+  }
 }
 
 /*
  * is_failed = db:is_failed()
  */
 static int dbclient_is_failed(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     bool is_failed = dbclient->isFailed();
     lua_pushboolean(L, is_failed);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "is_failed(", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "is_failed(", err);
+    return 2;
+  }
 }
 
 /*
  * addr = db:get_server_address()
  */
 static int dbclient_get_server_address(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     std::string address = dbclient->getServerAddress();
     lua_pushstring(L, address.c_str());
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_server_address(", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_server_address(", err);
+    return 2;
+  }
 }
 
 /*
- * count,err = db:count(ns, lua_table or json_str)
+ * count,err = db:count(ns, lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_count(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    int count = 0;
-    try {
-        BSONObj query;
-        int type = lua_type(L, 3);
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            query = fromjson(jsonstr);
-        } else if (type == LUA_TTABLE) {
-            lua_to_bson(L, 3, query);
-        }
-        count = dbclient->count(ns, query);
-    } catch (std::exception &e) {
-        lua_pushnil(L);
-        lua_pushfstring(L, LUAMONGO_ERR_COUNT_FAILED, e.what());
-        return 2;
+    BSONObj query;
+    if (!lua_to_bson_ordered(L, 3, query)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
+    int count = dbclient->count(ns, query);
     lua_pushinteger(L, count);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "count", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "count", err);
+    return 2;
+  }
 }
 
 /*
- * ok,err = db:insert(ns, lua_table or json_str)
+ * ok,err = db:insert(ns, lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_insert(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        int type = lua_type(L, 3);
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            dbclient->insert(ns, fromjson(jsonstr));
-        } else if (type == LUA_TTABLE) {
-            BSONObj data;
-            lua_to_bson(L, 3, data);
-
-            dbclient->insert(ns, data);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_INSERT_FAILED, e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    BSONObj data;
+    if (!lua_to_bson_ordered(L, 3, data)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
+    dbclient->insert(ns, data);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "insert", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "insert", err);
+    return 2;
+  }
 }
 
 /*
- * ok,err = db:insert_batch(ns, lua_array_of_tables)
+ * ok,err = db:insert_batch(ns, lua_array_of_tables/json_str/"ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_insert_batch(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-    luaL_checktype(L, 3, LUA_TTABLE);
-
-    try {
-        std::vector<BSONObj> vdata;
-        size_t tlen = lua_objlen(L, 3) + 1;
-        for (size_t i = 1; i < tlen; ++i) {
-            vdata.push_back(BSONObj());
-            lua_rawgeti(L, 3, i);
-            lua_to_bson(L, 4, vdata.back());
-            lua_pop(L, 1);
-        }
-        dbclient->insert(ns, vdata);
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_INSERT_FAILED, e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    std::vector<BSONObj> vdata;
+    if (!lua_to_bson_batched(L, 3, vdata)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
+    dbclient->insert(ns, vdata);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "insert_batch", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "insert_batch", err);
+    return 2;
+  }
 }
 
 /*
- * cursor,err = db:query(ns, lua_table or json_str or query_obj, limit, skip, lua_table or json_str, options, batchsize)
+ * cursor,err = db:query(ns, lua_table or json_str or query_obj OR "ARRAY OF LUA TABLE" (ORDERED), limit, skip, lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED), options, batchsize)
  */
 static int dbclient_query(lua_State *L) {
-    int n = lua_gettop(L);
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
     Query query;
     if (!lua_isnoneornil(L, 3)) {
-        try {
-            int type = lua_type(L, 3);
-            if (type == LUA_TSTRING) {
-                query = fromjson(luaL_checkstring(L, 3));
-            } else if (type == LUA_TTABLE) {
-                BSONObj obj;
-                lua_to_bson(L, 3, obj);
-                query = obj;
-            } else if (type == LUA_TUSERDATA) {
-                void *uq = 0;
-
-                uq = luaL_checkudata(L, 3, LUAMONGO_QUERY);
-                query = *(*((Query **)uq));
-            } else {
-                throw(LUAMONGO_REQUIRES_QUERY);
-            }
-        } catch (std::exception &e) {
-            lua_pushnil(L);
-            lua_pushfstring(L, LUAMONGO_ERR_QUERY_FAILED, e.what());
-            return 2;
-        } catch (const char *err) {
-            lua_pushnil(L);
-            lua_pushstring(L, err);
-            return 2;
-        }
+      if (!lua_to_bson_ordered_query(L, 3, query)) {
+        throw (LUAMONGO_REQUIRES_QUERY);
+      }
     }
 
     int nToReturn = luaL_optint(L, 4, 0);
@@ -300,275 +432,203 @@ static int dbclient_query(lua_State *L) {
 
     const BSONObj *fieldsToReturn = NULL;
     if (!lua_isnoneornil(L, 6)) {
-        int type = lua_type(L, 6);
-
-        if (type == LUA_TSTRING) {
-            fieldsToReturn = new BSONObj(luaL_checkstring(L, 6));
-        } else if (type == LUA_TTABLE) {
-            BSONObj obj;
-            lua_to_bson(L, 6, obj);
-            fieldsToReturn = new BSONObj(obj);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
+      BSONObj object;
+      if (lua_to_bson_ordered(L, 6, object)) {
+        fieldsToReturn = new BSONObj(object);
+      } else {
+        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+      }
     }
 
     int queryOptions = luaL_optint(L, 7, 0);
     int batchSize = luaL_optint(L, 8, 0);
 
+    //wont throw as handles it internally
     int res = cursor_create(L, dbclient, ns, query, nToReturn, nToSkip,
-                            fieldsToReturn, queryOptions, batchSize);
+            fieldsToReturn, queryOptions, batchSize);
 
     if (fieldsToReturn) {
-        delete fieldsToReturn;
+      delete fieldsToReturn;
     }
 
     return res;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "query", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "query", err);
+    return 2;
+  }
 }
 
 /**
- * lua_table,err = db:find_one(ns, lua_table or json_str or query_obj, lua_table or json_str, options)
+ * lua_table,err = db:find_one(ns, lua_table or json_str or query_obj OR "ARRAY OF LUA TABLE" (ORDERED), lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED), options)
  */
 static int dbclient_find_one(lua_State *L) {
-    int n = lua_gettop(L);
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
     Query query;
     if (!lua_isnoneornil(L, 3)) {
-        try {
-            int type = lua_type(L, 3);
-            if(type == LUA_TSTRING) {
-                query = fromjson(luaL_checkstring(L, 3));
-            } else if (type == LUA_TTABLE) {
-                BSONObj obj;
-                lua_to_bson(L, 3, obj);
-                query = obj;
-            } else if (type == LUA_TUSERDATA) {
-                void *uq = 0;
-                
-                uq = luaL_checkudata(L, 3, LUAMONGO_QUERY);
-                query = *(*((Query **)uq));
-            } else {
-                throw(LUAMONGO_REQUIRES_QUERY);
-            }
-        } catch(std::exception &e) {
-            lua_pushnil(L);
-            lua_pushfstring(L, LUAMONGO_ERR_FIND_ONE_FAILED, e.what());
-            return 2;
-        } catch (const char *err) {
-            lua_pushnil(L);
-            lua_pushstring(L, err);
-            return 2;
-        }
+      if (!lua_to_bson_ordered_query(L, 3, query)) {
+        throw (LUAMONGO_REQUIRES_QUERY);
+      }
     }
 
     const BSONObj *fieldsToReturn = NULL;
     if (!lua_isnoneornil(L, 4)) {
-        int type = lua_type(L, 4);
-
-        if (type == LUA_TSTRING) {
-            fieldsToReturn = new BSONObj(luaL_checkstring(L, 4));
-        } else if (type == LUA_TTABLE) {
-            BSONObj obj;
-            lua_to_bson(L, 4, obj);
-            fieldsToReturn = new BSONObj(obj);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-    }
+      BSONObj object;
+      if (lua_to_bson_ordered(L, 4, object)) {
+        fieldsToReturn = new BSONObj(object);
+      } else {
+        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+      }
+  }
 
     int queryOptions = luaL_optint(L, 5, 0);
-
-    int retval = 1;
-    try {
-        BSONObj ret = dbclient->findOne(ns, query, fieldsToReturn, queryOptions);
-        bson_to_lua(L, ret);
-    } catch (AssertionException &e) {
-        lua_pushnil(L);
-        lua_pushfstring(L, LUAMONGO_ERR_FIND_ONE_FAILED, e.what());
-        retval = 2;
-    }
-
+    BSONObj ret = dbclient->findOne(ns, query, fieldsToReturn, queryOptions);
+    bson_to_lua(L, ret);
     if (fieldsToReturn) {
-        delete fieldsToReturn;
+      delete fieldsToReturn;
     }
-    return retval;
+    return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "find_one", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "find_one", err);
+    return 2;
+  }
 }
 
 /*
- * ok,err = db:remove(ns, lua_table or json_str or query_obj)
+ * ok,err = db:remove(ns, lua_table or json_str or query_obj OR "ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_remove(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        int type = lua_type(L, 3);
-        bool justOne = lua_toboolean(L, 4);
-
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            dbclient->remove(ns, fromjson(jsonstr), justOne);
-        } else if (type == LUA_TTABLE) {
-            BSONObj data;
-            lua_to_bson(L, 3, data);
-
-            dbclient->remove(ns, data, justOne);
-        } else if (type == LUA_TUSERDATA) {
-            Query query;
-            void *uq = 0;
-
-            uq = luaL_checkudata(L, 3, LUAMONGO_QUERY);
-            query = *(*((Query **)uq));
-
-            dbclient->remove(ns, query, justOne);
-        } else {
-            throw(LUAMONGO_REQUIRES_QUERY);
-        }
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_REMOVE_FAILED, e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    Query query;
+    if (!lua_to_bson_ordered_query(L, 3, query)) {
+      throw (LUAMONGO_REQUIRES_QUERY);
     }
-
+    bool justOne = lua_toboolean(L, 4);
+    dbclient->remove(ns, query, justOne);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "remove", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "remove", err);
+    return 2;
+  }
 }
 
 /*
- * ok,err = db:update(ns, lua_table or json_str or query_obj, lua_table or json_str, upsert, multi)
+ * ok,err = db:update(ns, lua_table or json_str or query_obj OR "ARRAY OF LUA TABLE" (ORDERED), lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED), upsert, multi)
  */
 static int dbclient_update(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        int type_query = lua_type(L, 3);
-        int type_obj = lua_type(L, 4);
-
-        bool upsert = lua_toboolean(L, 5);
-        bool multi = lua_toboolean(L, 6);
-
-        Query query;
-        BSONObj obj;
-
-        if (type_query == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            query = fromjson(jsonstr);
-        } else if (type_query == LUA_TTABLE) {
-            BSONObj q;
-
-            lua_to_bson(L, 3, q);
-            query = q;
-        } else if (type_query == LUA_TUSERDATA) {
-            void *uq = 0;
-
-            uq = luaL_checkudata(L, 3, LUAMONGO_QUERY);
-            query = *(*((Query **)uq));
-        } else {
-            throw(LUAMONGO_REQUIRES_QUERY);
-        }
-
-        if (type_obj == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 4);
-            obj = fromjson(jsonstr);
-        } else if (type_obj == LUA_TTABLE) {
-            lua_to_bson(L, 4, obj);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-
-        dbclient->update(ns, query, obj, upsert, multi);
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_UPDATE_FAILED, e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    Query query;
+    if (!lua_to_bson_ordered_query(L, 3, query)) {
+      throw (LUAMONGO_REQUIRES_QUERY);
     }
+    BSONObj obj;
 
+    if (!lua_to_bson_ordered(L, 4, obj)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+    }
+    bool upsert = lua_toboolean(L, 5);
+    bool multi = lua_toboolean(L, 6);
+
+    dbclient->update(ns, query, obj, upsert, multi);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "update", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "update", err);
+    return 2;
+  }
 }
 
 /*
  * ok,err = db:drop_collection(ns)
  */
 static int dbclient_drop_collection(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        dbclient->dropCollection(ns);
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_collection", e.what());
-        return 2;
-    }
-
+    dbclient->dropCollection(ns);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_collection", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_collection", err);
+    return 2;
+  }
 }
 
 /*
- * ok,err = db:drop_index_by_fields(ns, json_str or lua_table)
+ * ok,err = db:drop_index_by_fields(ns, json_str or lua_table OR "ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_drop_index_by_fields(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
     BSONObj keys;
-
-    try {
-        int type = lua_type(L, 3);
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 3);
-            keys = fromjson(jsonstr);
-        } else if (type == LUA_TTABLE) {
-            lua_to_bson(L, 3, keys);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-
-        dbclient->dropIndex(ns, keys);
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_fields", e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushboolean(L, 0);
-        lua_pushstring(L, err);
-        return 2;
+    if (!lua_to_bson_ordered(L, 3, keys)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
+    dbclient->dropIndex(ns, keys);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_fields", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_fields", err);
+    return 2;
+  }
 }
 
 /*
  * ok,err = db:drop_index_by_name(ns, index_name)
  */
 static int dbclient_drop_index_by_name(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        dbclient->dropIndex(ns, luaL_checkstring(L, 3));
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_name", e.what());
-        return 2;
-    }
-
+    dbclient->dropIndex(ns, luaL_checkstring(L, 3));
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_name", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_index_by_name", err);
+    return 2;
+  }
 }
 
 /*
@@ -576,138 +636,129 @@ static int dbclient_drop_index_by_name(lua_State *L) {
  */
 static int dbclient_drop_indexes(lua_State *L) {
     DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-    const char *ns = luaL_checkstring(L, 2);
-
     try {
-        dbclient->dropIndexes(ns);
+      const char *ns = luaL_checkstring(L, 2);
+      dbclient->dropIndexes(ns);
+      lua_pushboolean(L, 1);
+      return 1;
     } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_indexes", e.what());
-        return 2;
+      lua_pushnil(L);
+      lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_indexes", e.what());
+      return 2;
+    } catch (const char *err) {
+      lua_pushnil(L);
+      lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "drop_indexes", err);
+      return 2;
     }
-
-    lua_pushboolean(L, 1);
-    return 1;
 }
 
 /*
  * res,err = (dbname, jscode[, args_table])
  */
 static int dbclient_eval(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
+
     const char *dbname = luaL_checkstring(L, 2);
     const char *jscode = luaL_checkstring(L, 3);
+    BSONObj *args = NULL;
+    if (!lua_isnoneornil(L, 4)) {
+      BSONObj tmpObj;
+      if (lua_to_bson_ordered(L, 4, tmpObj)) {
+        args = new BSONObj(tmpObj);
+      } else {
+        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+      }
+    }
 
     BSONObj info;
     BSONElement retval;
-    BSONObj *args = NULL;
-    if (!lua_isnoneornil(L, 4)) {
-        try {
-            int type = lua_type(L, 4);
-
-            if (type == LUA_TSTRING) {
-                args = new BSONObj(luaL_checkstring(L, 4));
-            } else if (type == LUA_TTABLE) {
-                BSONObj obj;
-                lua_to_bson(L, 4, obj);
-
-                args = new BSONObj(obj);
-            } else {
-                throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-            }
-        } catch (std::exception &e) {
-            lua_pushnil(L);
-            lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "eval", e.what());
-            return 2;
-        } catch (const char *err) {
-            lua_pushnil(L);
-            lua_pushstring(L, err);
-            return 2;
-        }
-    }
-
     bool res = dbclient->eval(dbname, jscode, info, retval, args);
-
-    if (!res) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "eval", info["errmsg"].str().c_str());
-
-        return 2;
-    }
-
     if (args) {
-        delete args;
+      delete args;
     }
-
+    if (!res) {
+      lua_pushboolean(L, 0);
+      lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "eval", info["errmsg"].str().c_str());
+      return 2;
+    }
     lua_push_value(L, retval);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "eval", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "eval", err);
+    return 2;
+  }
 }
 
 /*
  * bool = db:exists(ns)
  */
 static int dbclient_exists(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     const char *ns = luaL_checkstring(L, 2);
-
     bool res = dbclient->exists(ns);
-
     lua_pushboolean(L, res);
-
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "exists", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "exists", err);
+    return 2;
+  }
 }
 
 /*
- * name = db:gen_index_name(json_str or lua_table)
+ * name = db:gen_index_name(json_str or lua_table OR "ARRAY OF LUA TABLE" (ORDERED))
  */
 static int dbclient_gen_index_name(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     string name = "";
-
-    try {
-        int type = lua_type(L, 2);
-        if (type == LUA_TSTRING) {
-            const char *jsonstr = luaL_checkstring(L, 2);
-            name = dbclient->genIndexName(fromjson(jsonstr));
-        } else if (type == LUA_TTABLE) {
-            BSONObj data;
-            lua_to_bson(L, 2, data);
-
-            name = dbclient->genIndexName(data);
-        } else {
-            throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-        }
-    } catch (std::exception &e) {
-        lua_pushnil(L);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "gen_index_name", e.what());
-        return 2;
-    } catch (const char *err) {
-        lua_pushnil(L);
-        lua_pushstring(L, err);
-        return 2;
+    BSONObj tmpObj;
+    if (!lua_to_bson_ordered(L, 2, tmpObj)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-
+    name = dbclient->genIndexName(tmpObj);
     lua_pushstring(L, name.c_str());
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "gen_index_name", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "gen_index_name", err);
+    return 2;
+  }
 }
 
 /*
  * cursor,err = db:get_indexes(ns)
  */
 static int dbclient_get_indexes(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+
+  try {
     const char *ns = luaL_checkstring(L, 2);
 
     auto_ptr<DBClientCursor> autocursor = dbclient->getIndexes(ns);
 
     if (!autocursor.get()) {
-        lua_pushnil(L);
-        lua_pushstring(L, LUAMONGO_ERR_CONNECTION_LOST);
-        return 2;
+      lua_pushnil(L);
+      lua_pushstring(L, LUAMONGO_ERR_CONNECTION_LOST);
+      return 2;
     }
 
-    DBClientCursor **cursor = (DBClientCursor **)lua_newuserdata(L, sizeof(DBClientCursor *));
+    DBClientCursor **cursor = (DBClientCursor **) lua_newuserdata(L, sizeof (DBClientCursor *));
     *cursor = autocursor.get();
     autocursor.release();
 
@@ -715,169 +766,192 @@ static int dbclient_get_indexes(lua_State *L) {
     lua_setmetatable(L, -2);
 
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_indexes", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_indexes", err);
+    return 2;
+  }
 }
 
 /*
  * res,err = db:mapreduce(jsmapfunc, jsreducefunc[, query[, output]])
  */
 static int dbclient_mapreduce(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
+
     const char *ns = luaL_checkstring(L, 2);
     const char *jsmapfunc = luaL_checkstring(L, 3);
     const char *jsreducefunc = luaL_checkstring(L, 4);
 
     BSONObj query;
     if (!lua_isnoneornil(L, 5)) {
-        try {
-            int type = lua_type(L, 5);
-            if (type == LUA_TSTRING) {
-                const char *jsonstr = luaL_checkstring(L, 5);
-                query = fromjson(jsonstr);
-            } else if (type == LUA_TTABLE) {
-                lua_to_bson(L, 5, query);
-            } else {
-                throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-            }
-        } catch (std::exception &e) {
-            lua_pushnil(L);
-            lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "mapreduce", e.what());
-            return 2;
-        } catch (const char *err) {
-            lua_pushnil(L);
-            lua_pushstring(L, err);
-            return 2;
-        }
+      if (!lua_to_bson_ordered(L, 5, query)) {
+        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+      }
     }
 
     const char *output = luaL_optstring(L, 6, "");
-
     BSONObj res = dbclient->mapreduce(ns, jsmapfunc, jsreducefunc, query, output);
-
     bson_to_lua(L, res);
-
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "mapreduce", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "mapreduce", err);
+    return 2;
+  }
 }
 
 /*
  * ok,err = db:reindex(ns);
  */
 static int dbclient_reindex(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-    const char *ns = luaL_checkstring(L, 2);
-
-    try {
-        dbclient->reIndex(ns);
-    } catch (std::exception &e) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "reindex", e.what());
-        return 2;
-    }
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  const char *ns = luaL_checkstring(L, 2);
+  try {
+    dbclient->reIndex(ns);
     lua_pushboolean(L, 1);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "reindex", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "reindex", err);
+    return 2;
+  }
 }
 
 /*
  * db:reset_index_cache()
  */
 static int dbclient_reset_index_cache(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     dbclient->resetIndexCache();
-
     return 0;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "reset_index_cache", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "reset_index_cache", err);
+    return 2;
+  }
 }
 
 /*
  * db:get_last_error()
  */
 static int dbclient_get_last_error(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     string result = dbclient->getLastError();
     lua_pushlstring(L, result.c_str(), result.size());
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_last_error", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_last_error", err);
+    return 2;
+  }
 }
 
 /*
  * db:get_last_error_detailed()
  */
 static int dbclient_get_last_error_detailed(lua_State *L) {
-    DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-
+  DBClientBase *dbclient = userdata_to_dbclient(L, 1);
+  try {
     BSONObj res = dbclient->getLastErrorDetailed();
     bson_to_lua(L, res);
     return 1;
+  } catch (std::exception &e) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_last_error_detailed", e.what());
+    return 2;
+  } catch (const char *err) {
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "get_last_error_detailed", err);
+    return 2;
+  }
 }
 
 /*
- * res,err = db:run_command(dbname, lua_table or json_str, options)
+ * res,err = db:run_command(dbname, lua_table or json_str OR "ARRAY OF LUA TABLE" (ORDERED), options)
  */
 static int dbclient_run_command(lua_State *L) {
   DBClientBase *dbclient = userdata_to_dbclient(L, 1);
-  const char *ns = luaL_checkstring(L, 2);
-  int options = lua_tointeger(L, 4); // if it is invalid it returns 0
 
-  BSONObj command; // arg 3
   try {
-    int type = lua_type(L, 3);
-    if (type == LUA_TSTRING) {
-      const char *jsonstr = luaL_checkstring(L, 3);
-      command = fromjson(jsonstr);
-    } else if (type == LUA_TTABLE) {
-      lua_to_bson(L, 3, command);
-    } else {
-      throw(LUAMONGO_REQUIRES_JSON_OR_TABLE);
-    }
+    const char *ns = luaL_checkstring(L, 2);
+    int options = lua_tointeger(L, 4); // if it is invalid it returns 0
 
+    BSONObj command; // arg 3
+    if (!lua_to_bson_ordered(L, 3, command)) {
+      throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
+    }
     BSONObj retval;
     bool success = dbclient->runCommand(ns, command, retval, options);
-    if ( !success )
+    if (!success)
       throw "run_command failed";
 
-    bson_to_lua(L, retval );
+    bson_to_lua(L, retval);
     return 1;
   } catch (std::exception &e) {
-    lua_pushboolean(L, 0);
-    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION,
-            "run_command", e.what());
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "run_command", e.what());
     return 2;
   } catch (const char *err) {
-    lua_pushboolean(L, 0);
-    lua_pushstring(L, err);
+    lua_pushnil(L);
+    lua_pushfstring(L, LUAMONGO_ERR_CALLING, LUAMONGO_CONNECTION, "run_command", err);
     return 2;
   }
 }
 
 
+
 // Method registration table for DBClients
 extern const luaL_Reg dbclient_methods[] = {
-    {"auth", dbclient_auth},
-    {"count", dbclient_count},
-    {"drop_collection", dbclient_drop_collection},
-    {"drop_index_by_fields", dbclient_drop_index_by_fields},
-    {"drop_index_by_name", dbclient_drop_index_by_name},
-    {"drop_indexes", dbclient_drop_indexes},
-    {"ensure_index", dbclient_ensure_index},
-    {"eval", dbclient_eval},
-    {"exists", dbclient_exists},
-    {"find_one", dbclient_find_one},
-    {"gen_index_name", dbclient_gen_index_name},
-    {"get_indexes", dbclient_get_indexes},
-    {"get_last_error", dbclient_get_last_error},
-    {"get_last_error_detailed", dbclient_get_last_error_detailed},
-    {"get_server_address", dbclient_get_server_address},
-    {"insert", dbclient_insert},
-    {"insert_batch", dbclient_insert_batch},
-    {"is_failed", dbclient_is_failed},
-    {"mapreduce", dbclient_mapreduce},
-    {"query", dbclient_query},
-    {"reindex", dbclient_reindex},
-    {"remove", dbclient_remove},
-    {"reset_index_cache", dbclient_reset_index_cache},
-    {"run_command", dbclient_run_command},
-    {"update", dbclient_update},
-    {NULL, NULL}
+  {"auth", dbclient_auth},
+  {"count", dbclient_count},
+  {"drop_collection", dbclient_drop_collection},
+  {"drop_index_by_fields", dbclient_drop_index_by_fields},
+  {"drop_index_by_name", dbclient_drop_index_by_name},
+  {"drop_indexes", dbclient_drop_indexes},
+  {"ensure_index", dbclient_ensure_index},
+  {"eval", dbclient_eval},
+  {"exists", dbclient_exists},
+  {"find_one", dbclient_find_one},
+  {"gen_index_name", dbclient_gen_index_name},
+  {"get_indexes", dbclient_get_indexes},
+  {"get_last_error", dbclient_get_last_error},
+  {"get_last_error_detailed", dbclient_get_last_error_detailed},
+  {"get_server_address", dbclient_get_server_address},
+  {"insert", dbclient_insert},
+  {"insert_batch", dbclient_insert_batch},
+  {"is_failed", dbclient_is_failed},
+  {"mapreduce", dbclient_mapreduce},
+  {"query", dbclient_query},
+  {"reindex", dbclient_reindex},
+  {"remove", dbclient_remove},
+  {"reset_index_cache", dbclient_reset_index_cache},
+  {"run_command", dbclient_run_command},
+  {"update", dbclient_update},
+  {NULL, NULL}
 };
 
 
