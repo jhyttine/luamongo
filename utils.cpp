@@ -291,6 +291,170 @@ void lua_to_bson(lua_State *L, int stackpos, BSONObj &obj) {
     obj = builder.obj();
 }
 
+/***********************************************************************/
+// The following methods are helpers to parse lua tables parameter
+/***********************************************************************/
+
+/**
+ * Store helper
+ */
+template<typename T1>
+struct bson_store_to_target {
+};
+
+template<>
+struct bson_store_to_target<std::vector<BSONObj> > {
+    static inline bool store(BSONObj& obj, std::vector<BSONObj>& objects) {
+        objects.push_back(obj);
+        return true;
+    }
+};
+
+template<>
+struct bson_store_to_target<BSONObjBuilder > {
+    static inline bool store(BSONObj& obj, BSONObjBuilder& builder) {
+        builder.appendElementsUnique(obj);
+        return true;
+    }
+};
+
+/**
+ * Template to generate BSONObj with function T2 and store it to T1
+ */
+
+template<typename T1, bool (*T2)(lua_State*, int, BSONObj&)>
+struct lua_to_bson_generate_and_store {
+    static inline bool action(lua_State* L, int index, T1& target) {
+        BSONObj obj;
+        if (T2(L, index, obj)) {
+            bson_store_to_target<T1>::store(obj, target);
+            return true;
+        }
+        return false;
+    }
+};
+
+/**
+ * To generate content to target from next source:
+ *    "array of lua tables" (ordered)
+ *       sub table object are generated with T2 function
+ *    "else"
+ *       object is generated with T3 function
+ */
+template<typename T1, bool (*T2)(lua_State*, int , BSONObj&), bool (*T3)(lua_State*, int, BSONObj&)>
+bool lua_to_bson_auto_array(lua_State* L, int index, T1& target) {
+    bool res = false;
+    int type = lua_type(L, index);
+    size_t tlen = lua_objlen(L, index);
+    if (type == LUA_TTABLE && tlen) {
+        for (size_t i = 1; i <= tlen; ++i) {
+            lua_rawgeti(L, index, i);
+            res = lua_to_bson_generate_and_store<T1, T2>::action(L, index + 1, target);
+            lua_pop(L, 1);
+            if (!res) {
+                break;
+            }
+        }
+    } else {
+        res = lua_to_bson_generate_and_store<T1, T3>::action(L, index, target);
+    }
+    return res;
+}
+/**
+ * To generate BSONObject from next source:
+ *    "json string"
+ *    "lua table"
+ */
+bool lua_to_bson_select(lua_State* L, int index, BSONObj& obj) {
+    switch (lua_type(L, index)) {
+        case LUA_TSTRING:
+        {
+            const char *jsonstr = luaL_checkstring(L, index);
+            obj = fromjson(jsonstr);
+            return true;
+            break;
+        }
+        case LUA_TTABLE:
+        {
+            lua_to_bson(L, index, obj);
+            return true;
+            break;
+        }
+        default:
+        {
+            return false;
+        }
+    };
+    return false;
+}
+
+/**
+ * To generate BSONObject from next source:
+ *    "json string"
+ *    "lua table"
+ *    "array of lua tables" (ordered)
+ */
+bool lua_to_bson_ordered(lua_State* L, int index, BSONObj& object) {
+    if (1) {
+        BSONObjBuilder builder;
+        if (lua_to_bson_auto_array<BSONObjBuilder, lua_to_bson_select, lua_to_bson_select>(L, index, builder)) {
+            object = builder.obj();
+            return true;
+        }
+    } else {
+        //totally without ordered support
+        //as before
+        if (lua_to_bson_select(L, index, object)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * To generate Query from next source:
+ *    "Query object"
+ *    "json string"
+ *    "lua table"
+ *    "array of lua tables" (ordered)
+ */
+bool lua_to_bson_ordered_query(lua_State *L, int index, Query &query) {
+    if (LUA_TUSERDATA == lua_type(L, index)) {
+        void *uq = 0;
+        uq = luaL_checkudata(L, index, LUAMONGO_QUERY);
+        query = *(*((Query **) uq));
+        return true;
+    } else {
+        BSONObj obj;
+        if (lua_to_bson_ordered(L, index, obj)) {
+            query = obj;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * To generate vector of BSONObj from next source:
+ *    "json string"
+ *    "lua table"
+ *    "array of" (batch)
+ *       "json string"
+ *       "lua table"
+ *       "array of lua tables" (ordered)
+ */
+bool lua_to_bson_batched(lua_State* L, int index, std::vector<BSONObj>& objects) {
+    return lua_to_bson_auto_array<std::vector<BSONObj>, lua_to_bson_ordered, lua_to_bson_select>(L, index, objects);
+}
+
+/***********************************************************************/
+//
+/***********************************************************************/
+
+/**
+ * @param type
+ * @return 
+ */
 const char *bson_name(int type) {
     const char *name;
 

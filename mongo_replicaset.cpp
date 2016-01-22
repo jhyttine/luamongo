@@ -20,11 +20,11 @@ inline DBClientReplicaSet* userdata_to_replicaset(lua_State* L, int index) {
  * db,err = mongo.ReplicaSet.New(name, {hostAndPort1, ...)
  */
 static int replicaset_new(lua_State *L) {
-    luaL_checktype(L, 1, LUA_TSTRING);
-    luaL_checktype(L, 2, LUA_TTABLE);
-
     int resultcount = 1;
     try {
+        luaL_checktype(L, 1, LUA_TSTRING);
+        luaL_checktype(L, 2, LUA_TTABLE);
+
         const char *rs_name = luaL_checkstring(L, 1);
 
         std::vector<mongo::HostAndPort> rs_servers;
