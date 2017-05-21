@@ -61,8 +61,14 @@ struct Initializer {
     Initializer() : instance(0) { }
     ~Initializer() { delete instance; }
     void init() {
-	instance = new mongo::client::GlobalInstance();
-	instance->assertInitialized();
+        try {
+            instance = new mongo::client::GlobalInstance();
+            instance->assertInitialized();
+        } catch (mongo::UserException& e) {
+            if(e.getCode() != mongo::ErrorCodes::AlreadyInitialized){
+                throw e;
+            }
+        }
     }
 };
 Initializer initializer;
