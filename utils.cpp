@@ -345,7 +345,7 @@ template<typename T1, bool (*T2)(lua_State*, int , BSONObj&), bool (*T3)(lua_Sta
 bool lua_to_bson_auto_array(lua_State* L, int index, T1& target) {
     bool res = false;
     int type = lua_type(L, index);
-    size_t tlen = lua_objlen(L, index);
+    size_t tlen = lua_rawlen(L, index);
     if (type == LUA_TTABLE && tlen) {
         for (size_t i = 1; i <= tlen; ++i) {
             lua_rawgeti(L, index, i);
