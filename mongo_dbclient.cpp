@@ -753,26 +753,28 @@ static int dbclient_run_command(lua_State *L) {
     const char *ns = luaL_checkstring(L, 2);
     int options = lua_tointeger(L, 4); // if it is invalid it returns 0
 
-    BSONObj com_temp; // arg 3
-    if (!lua_to_bson_ordered(L, 3, com_temp)) {
+
+    BSONObj retval;
+    bool success;
+
+    BSONObj command; // arg 3
+    if (!lua_to_bson_ordered(L, 3, command)) {
        throw (LUAMONGO_REQUIRES_JSON_OR_TABLE);
     }
-    //--
-    BSONObj command;
-    if (!com_temp.hasElement("cmd")) {
-       throw "cmd field with the command name is mandatory";
-    }      
-    const char *cmd_key = com_temp.getStringField("cmd");
-    BSONElement cmd = com_temp[cmd_key];
-    com_temp.removeField("cmd");
-    // TODO: it is necessary => com_temp.removeField(cmd_key);
-    BSONObjBuilder b;
-    b.append(cmd);
-    b.appendElementsUnique(com_temp);
-    command = b.obj();
-     
-    BSONObj retval;
-    bool success = dbclient->runCommand(ns, command, retval, options);
+    if (!command.hasElement("cmd")) {
+      success = dbclient->runCommand(ns, command, retval, options);
+    } else {
+      const char *cmd_key = command.getStringField("cmd");
+      BSONElement cmd = command[cmd_key];
+      command.removeField("cmd");
+      // TODO: it is necessary => command.removeField(cmd_key);
+      BSONObjBuilder b;
+      b.append(cmd);
+      b.appendElementsUnique(command);
+      BSONObj command_new = b.obj();
+      success = dbclient->runCommand(ns, command_new, retval, options);
+    }
+
     if (!success)
       throw retval["errmsg"].str().c_str();
 
